@@ -2,6 +2,7 @@ name: Docker image
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -26,6 +27,7 @@ jobs:
           tags: |
             type=ref,event=tag
             type=sha,prefix=
+            type=raw,value=latest
 
   build:
     needs: meta
@@ -37,9 +39,6 @@ jobs:
           - platform: linux/amd64
             arch: amd64
             runner: ubuntu-latest
-          - platform: linux/arm64
-            arch: arm64
-            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
