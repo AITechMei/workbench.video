@@ -1,7 +1,7 @@
 import axios from "axios";
 import { nanoid } from "nanoid";
 import { WorkflowRequestError } from "./workflow-generation";
-import { BrowserParameterTranslation, findParameterTranslation, translationBody, translationHeaders, translationMediaAddress, type MatchedTranslation, type TranslationInput, type TranslationResult } from "./channel-parameter-translation";
+import { BrowserParameterTranslation, findParameterTranslation, normalizeTranslationAspectRatio, translationBody, translationHeaders, translationMediaAddress, type MatchedTranslation, type TranslationInput, type TranslationResult } from "./channel-parameter-translation";
 
 import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
 import { isMiniMaxH3Config, normalizeMiniMaxH3Duration, normalizeMiniMaxH3Ratio, normalizeMiniMaxH3Resolution } from "@/lib/minimax-video";
@@ -153,14 +153,14 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
 
 async function createTranslatedVideoTask(config: AiConfig, match: MatchedTranslation, prompt: string, references: Required<VideoReferenceInput>, options: VideoTaskCreateOptions, onProgress?: VideoProgressHandler): Promise<CreatedVideoGenerationTask> {
     const imageURL = async (image: ReferenceImage) => publicHttpUrl(image.url) || publicHttpUrl(image.dataUrl) || imageToDataUrl(image);
-    const mediaURL = async (media: ReferenceVideo | ReferenceAudio) => translationMediaAddress(await resolveMediaUrl(media.storageKey, media.url));
+    const mediaURL = async (media: ReferenceAudio) => translationMediaAddress(await resolveMediaUrl(media.storageKey, media.url));
     const input: TranslationInput = {
         kind: "video",
         variables: {
             model: config.model,
             prompt,
             size: config.size,
-            aspectRatio: config.size,
+            aspectRatio: normalizeTranslationAspectRatio(config.size),
             resolution: config.vquality,
             seconds: Number(config.videoSeconds),
             mode: config.videoMode,
@@ -168,7 +168,7 @@ async function createTranslatedVideoTask(config: AiConfig, match: MatchedTransla
             generateAudio: boolConfig(config.videoGenerateAudio, true),
             watermark: boolConfig(config.videoWatermark, false),
             images: await Promise.all(references.references.map(imageURL)),
-            videos: await Promise.all(references.videoReferences.map(mediaURL)),
+            videos: await Promise.all(references.videoReferences.map((reference) => elementReferenceToInputUrl({ ...reference, kind: "video" }))),
             audios: await Promise.all(references.audioReferences.map(mediaURL)),
             firstFrame: references.firstFrame ? await imageURL(references.firstFrame) : "",
             lastFrame: references.lastFrame ? await imageURL(references.lastFrame) : "",
@@ -179,16 +179,18 @@ async function createTranslatedVideoTask(config: AiConfig, match: MatchedTransla
     if (match.accountProxy) {
         options.signal?.throwIfAborted();
         options.onServerTask?.();
-        const response = await axios.post<ApiVideoResponse>("/api/v1/videos", translationBody(config, input), {
+        const clientTaskId = options.clientTaskId || `client_video_task_${nanoid()}`;
+        const response = await axios.post<Blob>("/api/v1/videos", translationBody(config, input), {
+            responseType: "blob",
             headers: {
                 ...translationHeaders(config, match),
-                ...(options.clientTaskId ? { "X-Client-Video-Task-ID": options.clientTaskId } : {}),
+                "X-Client-Video-Task-ID": clientTaskId,
                 ...(options.source ? { "X-Video-Task-Source": options.source } : {}),
                 ...(options.sourceId ? { "X-Video-Task-Source-ID": options.sourceId } : {}),
             },
-            timeout: match.timeout * 1000,
         });
-        task = unwrapVideoResponseForConfig(config, config.model, response.data);
+        if (response.data.type.includes("json")) task = unwrapVideoResponseForConfig(config, config.model, JSON.parse(await response.data.text()));
+        else task = await cacheProtectedVideo(config, config.model, await pollVideoGenerationTask(clientTaskId), undefined, new Response(response.data));
     } else {
         const translation = await BrowserParameterTranslation.create(config, match, input);
         let result: TranslationResult;
@@ -258,7 +260,7 @@ export async function pollCreatedVideoGenerationTask(config: AiConfig, task: Vid
         if (initialDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, initialDelayMs));
         for (; ;) {
             const polled: VideoResponse = await pollOnce();
-            const video = polled.parameter_translation ? polled : await cacheProtectedVideo(config, model, await cacheProtectedGeminiVideo(config, model, polled));
+            const video = polled.parameter_translation ? await syncGeneratedVideo(polled, config, true) : await cacheProtectedVideo(config, model, await cacheProtectedGeminiVideo(config, model, polled));
             onPoll?.(video);
             if (isFailedVideoStatus(video.status)) throw new VideoRequestError(video.error?.message || "视频生成失败", video);
             if (typeof video.progress === "number") onProgress?.(video.progress, video);
@@ -301,12 +303,15 @@ function videoSyncKey(config: AiConfig, task: VideoResponse) {
 async function syncGeneratedVideo(task: VideoResponse, config: AiConfig, contentResolved = false): Promise<VideoResponse> {
     const url = task.video_url || task.url || "";
     if (task.storageKey || isFailedVideoStatus(task.status) || (!isCompletedVideoStatus(task.status) && !url)) return task;
-    const media = await autoSyncToCloud(`video:${videoSyncKey(config, task)}`, async () => {
-        const model = config.model || config.videoModel;
-        const cached = contentResolved ? task : await cacheProtectedGeminiVideo(config, model, await cacheProtectedVideo(config, model, task));
-        if (cached.storageKey) return { url: cached.video_url || cached.url || url, storageKey: cached.storageKey };
-        return url ? uploadRemoteMediaToServer(url, "video") : null;
-    });
+    if (task.parameter_translation && !url) return cacheProtectedVideo(config, config.model || config.videoModel, task);
+    const media = task.parameter_translation && url.startsWith("data:video/")
+        ? await uploadMediaFile(url, "generated-video", `video:${videoSyncKey(config, task)}`)
+        : await autoSyncToCloud(`video:${videoSyncKey(config, task)}`, async () => {
+            const model = config.model || config.videoModel;
+            const cached = contentResolved ? task : await cacheProtectedGeminiVideo(config, model, await cacheProtectedVideo(config, model, task));
+            if (cached.storageKey) return { url: cached.video_url || cached.url || url, storageKey: cached.storageKey };
+            return url ? uploadRemoteMediaToServer(url, "video") : null;
+        });
     return media ? { ...task, url: media.url, video_url: media.url, storageKey: media.storageKey } : task;
 }
 
@@ -330,17 +335,18 @@ function isGrok2APIVideoConfig(config: AiConfig, model: string) {
     return (normalizedModel === "grok-imagine-video" || normalizedModel === "grok-imagine-video-1.5") && videoChannelProtocol(config, model) === "grok2api";
 }
 
-export async function cacheProtectedVideo(config: AiConfig, model: string, task: VideoResponse, contentRequest?: RequestInit) {
+export async function cacheProtectedVideo(config: AiConfig, model: string, task: VideoResponse, contentRequest?: RequestInit, contentResponse?: Response) {
     const url = task.video_url || task.url || "";
     const needsTaskContent = !url && ("object" in task && task.object === "video");
     const needsContentURL = /\/videos\/[^/?]+\/content(?:[?#]|$)/.test(contentRequest ? new URL(url).pathname : url);
     if (!isCompletedVideoStatus(task.status) || task.storageKey || (!needsTaskContent && !needsContentURL)) return task;
     const taskId = task.task_id || task.id || task.video_id || "";
-    const response = await fetch(contentRequest ? url : `${aiApiUrl(config, `/videos/${encodeURIComponent(taskId)}/content`)}?model=${encodeURIComponent(model)}`, contentRequest || { headers: aiHeaders(config) });
+    const response = contentResponse ?? await fetch(contentRequest ? url : `${aiApiUrl(config, `/videos/${encodeURIComponent(taskId)}/content`)}?model=${encodeURIComponent(model)}`, contentRequest || { headers: aiHeaders(config) });
     if (!response.ok) throw new VideoRequestError(`视频内容下载失败：${response.status}`, task);
     const blob = await response.blob();
-    if (contentRequest && (!blob.size || /json|^text\//i.test(blob.type))) throw new VideoRequestError("视频内容接口没有返回媒体文件", task);
-    const media = await uploadMediaFile(contentRequest && !blob.type.startsWith("video/") ? new Blob([blob], { type: "video/mp4" }) : blob, "generated-video", `video-content:${videoSyncKey(config, task)}`);
+    const translatedContent = task.parameter_translation && !url;
+    if ((contentRequest || translatedContent) && (!blob.size || /json|^text\//i.test(blob.type))) throw new VideoRequestError("视频内容接口没有返回媒体文件", task);
+    const media = await uploadMediaFile((contentRequest || translatedContent) && !blob.type.startsWith("video/") ? new Blob([blob], { type: "video/mp4" }) : blob, "generated-video", `video-content:${videoSyncKey(config, task)}`);
     return { ...task, url: media.url, video_url: media.url, storageKey: media.storageKey };
 }
 
